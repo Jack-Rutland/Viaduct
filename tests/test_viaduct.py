@@ -21,7 +21,9 @@ import tempfile
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from viaduct import cli_ops, kicad_cli, sexpr  # noqa: E402
-from viaduct.board import Board  # noqa: E402
+from viaduct.board import (  # noqa: E402
+    Board, _poly_area as _pa, _poly_inside as _pi, _polys_intersect as _px,
+)
 from viaduct.safety import BoardLockedError, lockfile_path, restore_backup  # noqa: E402
 from viaduct.schematic import Schematic  # noqa: E402
 
@@ -308,6 +310,76 @@ def main():
     except FileNotFoundError as e:
         print(f"  [skip] standard footprint library not found ({e})")
 
+    print("== board-outline & keep-out aware placement ==")
+    bp = pcb_fresh(tmp, "board4")
+    b = Board(bp)
+    loops = b._edge_cuts_loops()
+    check("Edge.Cuts outline reconstructed", len(loops) >= 1 and len(loops[0]) >= 4)
+    outer, _ = b._placement_region()
+    check("outer outline area sane", outer is not None and _pa(outer) > 100)
+    # keep-out to the right of U1; a cap anchored on the right-side pin must dodge it
+    b.add_zone([[52, 46], [60, 46], [60, 56], [52, 56]], "F.Cu",
+               keepout={"tracks": True, "copperpour": True}, name="ko")
+    nf = b.nearest_free_position("C1", "U1", "8", min_clearance_mm=0.3)
+    check("placement found despite keep-out", nf["x_mm"] is not None, str(nf))
+    b.move_footprint("C1", nf["x_mm"], nf["y_mm"])
+    cpoly = [e for e in b._courtyard_polys() if e["reference"] == "C1"][0]["front"]
+    _, blk = b._placement_region()
+    check("placed cap stays inside the board", _pi(cpoly, outer))
+    check("placed cap avoids the keep-out", not any(_px(cpoly, z) for z in blk))
+
+    print("== find_clear_region ==")
+    fcr = b.find_clear_region(3, 3, prefer_near_pad="U1.1", layer="F.Cu")
+    check("find_clear_region locates a spot", fcr["found"] and fcr["width_mm"] == 3, str(fcr))
+    rx, ry = fcr["x_mm"], fcr["y_mm"]
+    check("clear region lies on the board",
+          _pi([(rx, ry), (rx + 3, ry), (rx + 3, ry + 3), (rx, ry + 3)], outer))
+
+    print("== manual routing: route_trace / measure / via / delete ==")
+    rp = pcb_fresh(tmp, "board5")
+    b = Board(rp)
+    in_pads = [p for p in b.pads() if p["net"] == "IN"]
+    check("IN starts unrouted",
+          any(a["net"] == "IN" for a in b.ratsnest()["airwires"]))
+    r = b.add_track("IN", "F.Cu",
+                    [[in_pads[0]["x_mm"], in_pads[0]["y_mm"]],
+                     [in_pads[1]["x_mm"], in_pads[1]["y_mm"]]], 0.25)
+    check("route_trace adds a segment", r["segments_added"] == 1 and r["length_mm"] > 0)
+    check("routed net leaves the ratsnest",
+          not any(a["net"] == "IN" for a in b.ratsnest()["airwires"]))
+    ml = b.measure_track_length("IN")
+    check("measure_track_length", ml["routed_length_mm"] > 0 and ml["segment_count"] == 1)
+    v = b.place_via(in_pads[0]["x_mm"] + 0.3, in_pads[0]["y_mm"] + 0.3, "F.Cu", "B.Cu", "IN")
+    check("place_via two-layer", v["layers"] == ["F.Cu", "B.Cu"])
+    b.save()
+    check("KiCad accepts routed board", cli_ops.run_drc(rp)["violation_count"] >= 0)
+    dl = Board(rp).delete_tracks(net="IN")
+    check("delete_track removes the copper", dl["removed"] >= 2)
+    b = Board(rp)
+    b.delete_tracks(net="IN")
+    b.save()
+    check("IN unrouted again after delete",
+          any(a["net"] == "IN" for a in Board(rp).ratsnest()["airwires"]))
+
+    print("== spiral coil / named backup / netclass ==")
+    sp = pcb_fresh(tmp, "board6")
+    b = Board(sp)
+    sc = b.generate_spiral_coil((55, 52), 8, 3, 3, 0.2, "F.Cu", "GND")
+    check("spiral emits segments + endpoints",
+          sc["segments_added"] >= 20 and sc["length_mm"] > 0
+          and "start_mm" in sc and "end_mm" in sc)
+    b.save()
+    check("KiCad accepts board with spiral", cli_ops.run_drc(sp)["violation_count"] >= 0)
+    from viaduct.safety import create_named_backup, list_backups
+    create_named_backup(sp, "before risky!")
+    check("named backup listed",
+          any(x["kind"] == "named" for x in list_backups(sp)), str(list_backups(sp)))
+    nc = b.apply_netclass("GND", "Power")
+    check("apply_netclass assigns class", nc["netclass"] == "Power")
+    check("netclass pattern persisted to .kicad_pro",
+          any(p.get("pattern") == "GND"
+              for p in Board(sp).design_rules().get("netclass_patterns", [])))
+
     print("== MCP server (optional, needs `mcp` package) ==")
     try:
         import mcp  # noqa: F401
@@ -327,8 +399,12 @@ def main():
             "measure_placement_quality", "nearest_free_position",
             "auto_place_decoupling", "add_rule_area", "add_filled_zone",
             "footprint_info", "backup_list", "backup_restore_to",
+            # outline-aware placement, routing, coil, project edits
+            "find_clear_region", "route_trace", "place_via", "delete_track",
+            "measure_track_length", "generate_spiral_coil", "apply_netclass",
+            "backup_create",
         }
-        check("all 34 tools registered", expected <= names, str(expected - names))
+        check("all 42 tools registered", expected <= names, str(expected - names))
     except ImportError:
         print("  [skip] mcp package not installed; server registration not tested")
 
@@ -344,6 +420,9 @@ def pcb_fresh(tmp: str, name: str) -> str:
     """
     dst = os.path.join(tmp, f"{name}.kicad_pcb")
     shutil.copy2(os.path.join(PROJECT, "testboard.kicad_pcb"), dst)
+    pro = os.path.join(PROJECT, "testboard.kicad_pro")
+    if os.path.isfile(pro):  # keep the sibling project file for netclass/design-rule tests
+        shutil.copy2(pro, os.path.join(tmp, f"{name}.kicad_pro"))
     return dst
 
 

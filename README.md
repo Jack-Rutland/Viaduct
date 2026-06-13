@@ -1,8 +1,8 @@
 # viaduct
 
 An MCP server that lets Claude do PCB work in [KiCad](https://kicad.org): inspect boards,
-place footprints, measure ratsnest length, run ERC/DRC, render images for visual review,
-and export fabrication outputs.
+place footprints (collision- and outline-aware), lay manual copper, measure ratsnest
+length, run ERC/DRC, render images for visual review, and export fabrication outputs.
 
 No KiCad Python bindings required — viaduct parses `.kicad_pcb` / `.kicad_sch` files with
 its own s-expression parser and shells out to `kicad-cli` for checks, exports, and renders.
@@ -53,13 +53,21 @@ Sanity check: ask Claude to run the `kicad_version` tool.
 | `footprint_info` | Dimensions, pad count, courtyard of a library footprint, *without* placing it |
 | `move_footprint` | Move/rotate one footprint (pad angles handled), with backup; can reject collisions |
 | `move_footprints` | Batch move — one backup, one save; reports collisions, optional reject-on-collision |
-| `nearest_free_position` | Closest spot to a pin where a footprint's courtyard clears everything (no move) |
-| `auto_place_decoupling` | Seat decoupling caps against the IC pin each one shares a net with |
+| `nearest_free_position` | Closest spot to a pin where a footprint's courtyard clears everything, on-board and outside keep-outs (no move) |
+| `auto_place_decoupling` | Seat decoupling caps against the IC pin each shares a net with, on-board and clear of keep-outs |
+| `find_clear_region` | Find an empty area of a given size on a layer, nearest a pin or the board centre |
 | `set_board_outline_rect` | Replace the Edge.Cuts outline with a rectangle |
 | `add_rule_area` | Add a keep-out rule area over a polygon |
 | `add_filled_zone` | Add a copper-pour zone outline on a net (KiCad computes the fill on open) |
+| `route_trace` | Draw a copper track for a net along a polyline you supply |
+| `place_via` | Add a via on a net joining two layers |
+| `delete_track` | Delete tracks/vias matching a net/layer/uuid filter (undo a route) |
+| `measure_track_length` | Routed copper length on a net + via count (the routed counterpart to `ratsnest`) |
+| `generate_spiral_coil` | Lay an Archimedean spiral (e.g. NFC antenna) as track segments |
+| `apply_netclass` | Assign a net to an existing netclass in the `.kicad_pro` |
 | `restore_backup` | Restore a file from the `.bak` written before the last edit |
-| `backup_list` / `backup_restore_to` | List the rolling numbered backup history and restore any entry |
+| `backup_create` | Snapshot a file under a chosen name (a checkpoint before a risky change) |
+| `backup_list` / `backup_restore_to` | List the rolling history + named snapshots and restore any entry |
 | `list_symbols` | Schematic symbols: reference, value, lib_id, footprint, position |
 | `list_labels` | Local/global/hierarchical net labels |
 | `set_symbol_property` | Set Value, Footprint, MPN, … on a symbol |
@@ -125,8 +133,13 @@ Lay out the board at <path/to/board.kicad_pcb>. Process:
 5. run_drc; fix every courtyard overlap and clearance violation.
 6. Repeat 3-5 until DRC is clean and the render looks tidy, then report
    total airwire length before vs after and remaining concerns.
-Do not route traces. Never edit while the board is open in KiCad.
+Never edit while the board is open in KiCad.
 ---
+
+To route after placing, plan each net's path yourself (from `connectivity` and
+`design_rules` clearances) and lay it with `route_trace` / `place_via`, then run `run_drc`
+to catch shorts and clearance violations — there is no autorouter. `delete_track` undoes a
+route; `measure_track_length` reports routed length per net.
 
 ## Development
 

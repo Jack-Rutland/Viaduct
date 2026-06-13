@@ -233,37 +233,59 @@ def measure_placement_quality(board_path: str) -> dict:
 
 @mcp.tool()
 def nearest_free_position(board_path: str, reference: str, anchor_pad: str,
-                          min_clearance_mm: float = 0.2,
-                          max_radius_mm: float = 40.0) -> dict:
+                          min_clearance_mm: float = 0.2, max_radius_mm: float = 40.0,
+                          on_board: bool = True, avoid_rule_areas: bool = True) -> dict:
     """Closest position to a pin where a footprint's courtyard is clear.
 
     anchor_pad is 'REF.PAD' (e.g. 'U1.28'). Searches outward from that pad and
     returns the nearest footprint origin (current rotation kept) where
     reference's courtyard clears every other footprint by min_clearance_mm.
-    Does not move anything — feed the returned x_mm/y_mm to move_footprints.
+    With on_board the spot must lie inside the board outline; with
+    avoid_rule_areas it must clear keep-out zones and board cut-outs. Does not
+    move anything — feed the returned x_mm/y_mm to move_footprints.
     """
     if "." not in anchor_pad:
         raise ValueError("anchor_pad must be 'REF.PAD', e.g. 'U1.28'")
     aref, apad = anchor_pad.rsplit(".", 1)
     return Board(board_path).nearest_free_position(
         reference, aref, apad, min_clearance_mm=min_clearance_mm,
-        max_radius_mm=max_radius_mm)
+        max_radius_mm=max_radius_mm, on_board=on_board,
+        avoid_rule_areas=avoid_rule_areas)
 
 
 @mcp.tool()
 def auto_place_decoupling(board_path: str, ic_reference: str, caps: list[str],
-                          clearance_mm: float = 0.2) -> dict:
+                          clearance_mm: float = 0.2, on_board: bool = True,
+                          avoid_rule_areas: bool = True) -> dict:
     """Place decoupling caps next to the IC pin each one shares a net with, then save.
 
     For every cap, picks an IC pad on a shared net (preferring a supply pin) and
     seats the cap's courtyard against the IC without overlapping anything already
-    placed. Reports placed/unplaced caps and ratsnest length before vs after.
-    Writes a .bak backup; refuses if the board is open in KiCad.
+    placed, staying inside the board outline (on_board) and clear of keep-out
+    zones (avoid_rule_areas). Reports placed/unplaced caps and ratsnest length
+    before vs after. Writes a .bak backup; refuses if open in KiCad.
     """
     board = Board(board_path)
-    result = board.auto_place_decoupling(ic_reference, caps, clearance_mm)
+    result = board.auto_place_decoupling(
+        ic_reference, caps, clearance_mm, on_board=on_board,
+        avoid_rule_areas=avoid_rule_areas)
     result["backup"] = board.save()
     return result
+
+
+@mcp.tool()
+def find_clear_region(board_path: str, min_width_mm: float, min_height_mm: float,
+                      prefer_near_pad: str | None = None, layer: str = "F.Cu",
+                      clearance_mm: float = 0.0) -> dict:
+    """Find an empty area of at least min_width × min_height mm on a layer.
+
+    Scans the board for a rectangle inside the outline that clears every
+    courtyard on `layer` (by clearance_mm) and avoids keep-out zones / cut-outs.
+    Returns the region nearest prefer_near_pad ('REF.PAD') or the board centre —
+    use it to park loose parts. Does not move anything.
+    """
+    return Board(board_path).find_clear_region(
+        min_width_mm, min_height_mm, prefer_near_pad, layer, clearance_mm=clearance_mm)
 
 
 @mcp.tool()
@@ -314,6 +336,92 @@ def footprint_info(footprint_name: str) -> dict:
     return footprints.footprint_info(footprint_name)
 
 
+# ---------------------------------------------------------------------------
+# routing (manual: you supply the path, run_drc verifies)
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def route_trace(board_path: str, net: str, layer: str, points: list[list[float]],
+                width_mm: float = 0.25) -> dict:
+    """Draw a copper track for a net along a polyline, then save.
+
+    points is [[x,y], ...] in board mm (e.g. two pad positions for a straight
+    trace). You plan the path; viaduct lays the segments and run_drc verifies
+    clearances/shorts. Writes a .bak backup; refuses if open in KiCad.
+    """
+    board = Board(board_path)
+    result = board.add_track(net, layer, points, width_mm)
+    result["backup"] = board.save()
+    return result
+
+
+@mcp.tool()
+def place_via(board_path: str, x_mm: float, y_mm: float, net: str,
+              from_layer: str = "F.Cu", to_layer: str = "B.Cu",
+              size_mm: float = 0.6, drill_mm: float = 0.3) -> dict:
+    """Add a via on a net joining two layers, then save.
+
+    Writes a .bak backup; refuses if the board is open in KiCad.
+    """
+    board = Board(board_path)
+    result = board.place_via(x_mm, y_mm, from_layer, to_layer, net, size_mm, drill_mm)
+    result["backup"] = board.save()
+    return result
+
+
+@mcp.tool()
+def delete_track(board_path: str, net: str | None = None, layer: str | None = None,
+                 uuid: str | None = None) -> dict:
+    """Delete tracks/vias matching a filter (net and/or layer and/or uuid), then save.
+
+    Requires at least one filter so the whole board can't be wiped by accident.
+    Use it to undo a route. Writes a .bak backup; refuses if open in KiCad.
+    """
+    board = Board(board_path)
+    result = board.delete_tracks(net, layer, uuid)
+    result["backup"] = board.save()
+    return result
+
+
+@mcp.tool()
+def measure_track_length(board_path: str, net: str) -> dict:
+    """Total routed copper length on a net (segments + arcs) and its via count.
+
+    Read-only; the routed counterpart to ratsnest (which measures what's *not*
+    yet routed).
+    """
+    return Board(board_path).measure_track_length(net)
+
+
+@mcp.tool()
+def generate_spiral_coil(board_path: str, net: str, center_x_mm: float,
+                         center_y_mm: float, od_mm: float, id_mm: float,
+                         turns: float, trace_width_mm: float, layer: str = "F.Cu",
+                         points_per_turn: int = 48) -> dict:
+    """Lay an Archimedean spiral coil (e.g. NFC antenna) as track segments, then save.
+
+    Spirals from id_mm to od_mm over `turns` revolutions on `layer`. Returns the
+    start/end coordinates so you can route the ends into the net. Writes a .bak
+    backup; refuses if the board is open in KiCad.
+    """
+    board = Board(board_path)
+    result = board.generate_spiral_coil(
+        (center_x_mm, center_y_mm), od_mm, id_mm, turns, trace_width_mm,
+        layer, net, points_per_turn)
+    result["backup"] = board.save()
+    return result
+
+
+@mcp.tool()
+def apply_netclass(board_path: str, net: str, netclass: str) -> dict:
+    """Assign a net to an existing netclass in the sibling .kicad_pro, then save it.
+
+    The netclass must already be defined in the project. Edits the .kicad_pro
+    (not the board); writes a .bak of it first.
+    """
+    return Board(board_path).apply_netclass(net, netclass)
+
+
 @mcp.tool()
 def set_board_outline_rect(board_path: str, x_mm: float, y_mm: float,
                            width_mm: float, height_mm: float) -> dict:
@@ -333,6 +441,15 @@ def restore_backup(file_path: str) -> dict:
     """Restore a .kicad_pcb/.kicad_sch file from the .bak written before the last edit."""
     restored = safety.restore_backup(file_path)
     return {"restored": restored, "from": safety.backup_path(file_path)}
+
+
+@mcp.tool()
+def backup_create(file_path: str, name: str) -> dict:
+    """Snapshot a file under a chosen name (e.g. 'before-reroute') you can return to
+    later with backup_restore_to. A manual checkpoint independent of the automatic
+    per-edit backups."""
+    dst = safety.create_named_backup(file_path, name)
+    return {"created": dst, "name": os.path.basename(dst)}
 
 
 @mcp.tool()

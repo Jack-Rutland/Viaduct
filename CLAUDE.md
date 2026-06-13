@@ -25,7 +25,12 @@ encodes — follow it when asked to lay out a board):
 5. **Verify**: `run_drc`; fix every courtyard overlap and clearance violation.
 6. Repeat 3–5 until clean. Report airwire length before vs after.
 
-Placement only — do not attempt to route traces by editing the file.
+Placement is the core loop, but viaduct can also lay **manual** copper: `route_trace`
+(you supply the polyline), `place_via`, `delete_track`, `measure_track_length`, and
+`generate_spiral_coil`. There is deliberately **no autorouter** — kicad-cli has no route
+verb, so you plan the path and `run_drc` is the ground-truth check for shorts/clearance.
+Don't add one (it would mean writing a router or bundling Freerouting/Java, breaking the
+single-dependency rule).
 
 ## Conventions and caveats
 
@@ -35,8 +40,16 @@ Placement only — do not attempt to route traces by editing the file.
   (`~<name>.kicad_pcb.lck`) exists. Tell the user to close the file in KiCad rather than
   working around it; a stale lockfile after a crash may be deleted manually. Read-only
   tools, renders, and exports are safe with KiCad open.
-- **Backups**: every edit writes `<file>.bak` first (only the last edit is kept).
-  `restore_backup` restores it. Prefer one `move_footprints` batch over many
+- **Placement constraints**: `nearest_free_position` / `auto_place_decoupling` /
+  `find_clear_region` reconstruct the Edge.Cuts outline (loops stitched from line/arc/rect,
+  largest = boundary, inner loops = cut-outs) and treat cut-outs + keep-out zones as
+  blockers. `on_board` / `avoid_rule_areas` (default True) gate this; turn them off to
+  allow off-board or in-keepout placement deliberately. Inter-courtyard checks use convex
+  SAT; blocker/outline checks use general (non-convex) polygon intersection.
+- **Backups**: every edit writes `<file>.bak` first (only the last edit is kept), plus a
+  rolling numbered history (`.vbakNNNN`, last 10) and any explicit `backup_create` named
+  snapshots. `restore_backup` restores the `.bak`; `backup_list`/`backup_restore_to` reach
+  the history and named snapshots. Prefer one `move_footprints` batch over many
   `move_footprint` calls so the .bak spans the whole pass.
 - **Ratsnest** merges pads already joined by tracks/vias (zone fills are ignored — pads
   connected only through a copper pour still show as airwires). Airwires are MST edges,
@@ -65,9 +78,11 @@ Placement only — do not attempt to route traces by editing the file.
 - `src/viaduct/sexpr.py` — parser/serializer. Quoted strings → `str`, bare tokens →
   `Sym(str)`; numbers stay as source text so untouched values round-trip exactly.
 - `src/viaduct/board.py` — board model: footprints, pads, courtyards, ratsnest, moves,
-  plus SAT courtyard-collision detection (`_poly_separation`/`collisions`),
+  plus SAT courtyard-collision detection (`_poly_separation`/`collisions`), outline-aware
   placement helpers (`nearest_free_position`, `auto_place_decoupling`,
-  `measure_placement_quality`), and zone/rule-area insertion (`add_zone`).
+  `find_clear_region`, `measure_placement_quality`), zone/rule-area insertion
+  (`add_zone`), manual routing (`add_track`/`place_via`/`delete_tracks`/
+  `measure_track_length`/`generate_spiral_coil`), and `apply_netclass` (edits .kicad_pro).
 - `src/viaduct/footprints.py` — read `.kicad_mod` library files for `footprint_info`
   (dimensions/courtyard *without* placing); honours `VIADUCT_FOOTPRINT_DIRS`.
 - `src/viaduct/schematic.py` — symbols, labels, properties.

@@ -105,10 +105,28 @@ def make_history_backup(file_path: str, keep: int = HISTORY_KEEP) -> str | None:
     return dst
 
 
-def list_backups(file_path: str) -> list[dict]:
-    """All backups for a file: the last-edit ``.bak`` plus the numbered history.
+NAMED_PREFIX = ".named-"
 
-    Newest first. The ``name`` of each entry is what :func:`restore_to` accepts.
+
+def create_named_backup(file_path: str, name: str) -> str:
+    """Snapshot the current file under a chosen name (e.g. 'before-reroute').
+
+    Unlike the automatic per-edit backups, this is a manual checkpoint you can
+    return to later with restore_to. Returns the backup's full path.
+    """
+    file_path = os.path.abspath(file_path)
+    if not os.path.isfile(file_path):
+        raise BackupError(f"cannot back up {file_path}: file does not exist")
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", name).strip("._-") or "snapshot"
+    dst = f"{file_path}{NAMED_PREFIX}{safe}"
+    shutil.copy2(file_path, dst)
+    return dst
+
+
+def list_backups(file_path: str) -> list[dict]:
+    """All backups for a file: the last-edit ``.bak``, named snapshots, and the
+    numbered history (newest history first). Each ``name`` is what
+    :func:`restore_to` accepts.
     """
     file_path = os.path.abspath(file_path)
     out = []
@@ -116,6 +134,9 @@ def list_backups(file_path: str) -> list[dict]:
     if os.path.isfile(bak):
         out.append({"name": os.path.basename(bak), "kind": "last_edit",
                     "size_bytes": os.path.getsize(bak)})
+    for p in sorted(glob.glob(f"{file_path}{NAMED_PREFIX}*")):
+        out.append({"name": os.path.basename(p), "kind": "named",
+                    "size_bytes": os.path.getsize(p)})
     for p in sorted(glob.glob(_history_glob(file_path)), key=_history_index, reverse=True):
         out.append({"name": os.path.basename(p), "kind": "history",
                     "index": _history_index(p), "size_bytes": os.path.getsize(p)})

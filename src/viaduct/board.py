@@ -171,6 +171,114 @@ def _poly_area(poly: list[tuple[float, float]]) -> float:
     return abs(s) / 2.0
 
 
+def _point_in_poly(pt: tuple[float, float], poly: list[tuple[float, float]]) -> bool:
+    """Ray-casting point-in-polygon for an arbitrary simple polygon."""
+    x, y = pt
+    inside = False
+    n = len(poly)
+    for i in range(n):
+        x1, y1 = poly[i]
+        x2, y2 = poly[(i + 1) % n]
+        if (y1 > y) != (y2 > y):
+            xint = x1 + (y - y1) * (x2 - x1) / (y2 - y1)
+            if x < xint:
+                inside = not inside
+    return inside
+
+
+def _segments_cross(p1, p2, p3, p4) -> bool:
+    """Do segments p1-p2 and p3-p4 properly intersect?"""
+    def ccw(a, b, c):
+        return (c[1] - a[1]) * (b[0] - a[0]) - (b[1] - a[1]) * (c[0] - a[0])
+    d1 = ccw(p3, p4, p1)
+    d2 = ccw(p3, p4, p2)
+    d3 = ccw(p1, p2, p3)
+    d4 = ccw(p1, p2, p4)
+    return ((d1 > 0) != (d2 > 0)) and ((d3 > 0) != (d4 > 0))
+
+
+def _polys_intersect(a: list[tuple[float, float]], b: list[tuple[float, float]]) -> bool:
+    """True if two simple polygons overlap at all (edge cross or containment).
+
+    Works for non-convex polygons, unlike :func:`_poly_separation` (which is
+    convex-only but also reports a signed gap). Use this for keep-out zones and
+    board cut-outs, whose outlines need not be convex.
+    """
+    na, nb = len(a), len(b)
+    for i in range(na):
+        for j in range(nb):
+            if _segments_cross(a[i], a[(i + 1) % na], b[j], b[(j + 1) % nb]):
+                return True
+    return _point_in_poly(a[0], b) or _point_in_poly(b[0], a)
+
+
+def _poly_inside(inner: list[tuple[float, float]], outer: list[tuple[float, float]]) -> bool:
+    """True if *inner* lies wholly inside *outer* (vertices in, no edge crossings)."""
+    if not all(_point_in_poly(p, outer) for p in inner):
+        return False
+    ni, no = len(inner), len(outer)
+    for i in range(ni):
+        for j in range(no):
+            if _segments_cross(inner[i], inner[(i + 1) % ni],
+                               outer[j], outer[(j + 1) % no]):
+                return False
+    return True
+
+
+def _arc_length(p1, p2, p3) -> float:
+    """Length of the circular arc through three points (chord if collinear)."""
+    ax, ay = p1
+    bx, by = p2
+    cx, cy = p3
+    d = 2 * (ax * (by - cy) + bx * (cy - ay) + cx * (ay - by))
+    if abs(d) < 1e-12:
+        return math.dist(p1, p3)
+    ux = ((ax * ax + ay * ay) * (by - cy) + (bx * bx + by * by) * (cy - ay)
+          + (cx * cx + cy * cy) * (ay - by)) / d
+    uy = ((ax * ax + ay * ay) * (cx - bx) + (bx * bx + by * by) * (ax - cx)
+          + (cx * cx + cy * cy) * (bx - ax)) / d
+    r = math.hypot(ax - ux, ay - uy)
+    a1 = math.atan2(ay - uy, ax - ux)
+    a2 = math.atan2(cy - uy, cx - ux)
+    am = math.atan2(by - uy, bx - ux)
+
+    def norm(a):
+        while a < 0:
+            a += 2 * math.pi
+        return a
+
+    sweep = norm(a2 - a1)
+    if norm(am - a1) > sweep:
+        sweep -= 2 * math.pi
+    return abs(r * sweep)
+
+
+def _stitch_loops(segs: list[tuple], tol: float = 0.01) -> list[list[tuple[float, float]]]:
+    """Stitch (start, end, points) segments into closed loops by matching endpoints."""
+    def key(p):
+        return (round(p[0] / tol), round(p[1] / tol))
+
+    remaining = list(segs)
+    loops = []
+    while remaining:
+        start, end, pts = remaining.pop(0)
+        chain = list(pts)
+        changed = True
+        while changed and key(chain[0]) != key(chain[-1]):
+            changed = False
+            for i, (s, e, p) in enumerate(remaining):
+                if key(e) == key(chain[-1]):
+                    s, e, p = e, s, list(reversed(p))
+                if key(s) == key(chain[-1]):
+                    chain.extend(p[1:])
+                    remaining.pop(i)
+                    changed = True
+                    break
+        if len(chain) >= 4 and key(chain[0]) == key(chain[-1]):
+            loops.append(chain[:-1])
+    return loops
+
+
 class Board:
     def __init__(self, path: str):
         self.path = os.path.abspath(path)
@@ -737,6 +845,81 @@ class Board:
         pairs.sort(key=lambda p: p["gap_mm"])
         return pairs
 
+    # -- board outline & zone geometry (for on-board / keep-out placement) ----
+
+    def _edge_cuts_loops(self) -> list[list[tuple[float, float]]]:
+        """Closed polygons reconstructed from the Edge.Cuts graphics.
+
+        Rectangles and polys become loops directly; loose line/arc segments are
+        stitched together by matching endpoints. Arcs are sampled to a few
+        points. Returns every closed loop found (outer boundary plus any
+        cut-outs); empty if the outline can't be reconstructed.
+        """
+        loops: list[list[tuple[float, float]]] = []
+        open_segs: list[tuple] = []
+        for kind in GR_SHAPES:
+            for shape in children(self.root, kind):
+                layer = child(shape, "layer")
+                if layer is None or str(layer[1]) != "Edge.Cuts":
+                    continue
+                k = kind.replace("gr_", "")
+                if k == "rect":
+                    pts = _full_shape_points(shape, "rect")
+                    if len(pts) == 4:
+                        loops.append(pts)
+                elif k == "poly":
+                    pts = _full_shape_points(shape, "poly")
+                    if len(pts) >= 3:
+                        loops.append(pts)
+                elif k == "circle":
+                    pts = _full_shape_points(shape, "circle")  # bbox square
+                    if len(pts) == 4:
+                        loops.append(pts)
+                elif k in ("line", "arc"):
+                    pts = _full_shape_points(shape, k)
+                    if len(pts) >= 2:
+                        open_segs.append((pts[0], pts[-1], pts))
+        loops.extend(_stitch_loops(open_segs))
+        return [lp for lp in loops if len(lp) >= 3]
+
+    def _zone_polygons(self, keepout_only: bool = False) -> list[dict]:
+        """Outline polygon of each zone on the board (board mm)."""
+        out = []
+        for z in children(self.root, "zone"):
+            poly_node = child(z, "polygon")
+            pts_node = child(poly_node, "pts") if poly_node else None
+            if not pts_node:
+                continue
+            pts = [(to_float(xy[1]), to_float(xy[2])) for xy in children(pts_node, "xy")]
+            if len(pts) < 3:
+                continue
+            is_keepout = child(z, "keepout") is not None
+            if keepout_only and not is_keepout:
+                continue
+            name = child(z, "name")
+            out.append({
+                "name": str(name[1]) if name and len(name) > 1 else "",
+                "keepout": is_keepout,
+                "polygon": pts,
+            })
+        return out
+
+    def _placement_region(self):
+        """(outer_outline_or_None, [blocker_polygons]) for on-board placement.
+
+        The outer outline is the largest-area Edge.Cuts loop; smaller loops
+        inside it are treated as cut-outs (blockers), as are keep-out zones.
+        """
+        loops = self._edge_cuts_loops()
+        outer = max(loops, key=_poly_area) if loops else None
+        blockers = []
+        for lp in loops:
+            if lp is not outer and outer is not None and _poly_inside(lp, outer):
+                blockers.append(lp)
+        for z in self._zone_polygons(keepout_only=True):
+            blockers.append(z["polygon"])
+        return outer, blockers
+
     # -- targeted queries -----------------------------------------------------
 
     def pad_position(self, reference: str, pad_number) -> dict:
@@ -799,13 +982,17 @@ class Board:
                               anchor_pad, min_clearance_mm: float = 0.2,
                               search_step_mm: float = 0.25,
                               angle_step_deg: float = 15.0,
-                              max_radius_mm: float = 40.0) -> dict:
+                              max_radius_mm: float = 40.0,
+                              on_board: bool = True,
+                              avoid_rule_areas: bool = True) -> dict:
         """Closest position to an anchor pad where *reference*'s courtyard is clear.
 
         Searches outward in rings from the anchor pad and returns the first
         footprint origin (current rotation kept) at which this footprint's
-        courtyard clears every other footprint by ``min_clearance_mm``. Does not
-        move anything — returns the suggested (x_mm, y_mm).
+        courtyard clears every other footprint by ``min_clearance_mm``. With
+        ``on_board`` the courtyard must also sit wholly inside the board outline;
+        with ``avoid_rule_areas`` it must not enter any keep-out zone or board
+        cut-out. Does not move anything — returns the suggested (x_mm, y_mm).
         """
         fp = self.find_footprint(reference)
         anchor = self.pad_position(anchor_reference, anchor_pad)
@@ -813,6 +1000,11 @@ class Board:
         polys = self._courtyard_polys()
         mine = next((e for e in polys if e["reference"] == reference), None)
         others = [e for e in polys if e["reference"] != reference and "front" in e]
+        outer, blockers = self._placement_region()
+        if not on_board:
+            outer = None
+        if not avoid_rule_areas:
+            blockers = []
         fx, fy, _ = _get_at(fp)
         if mine is None or "front" not in mine:
             return {
@@ -833,6 +1025,11 @@ class Board:
             return min((_poly_separation(cand, e["front"]) for e in others),
                        default=math.inf)
 
+        def allowed(cand):
+            if outer is not None and not _poly_inside(cand, outer):
+                return False
+            return not any(_polys_intersect(cand, blk) for blk in blockers)
+
         r = 0.0
         while r <= max_radius_mm:
             if r == 0.0:
@@ -847,7 +1044,7 @@ class Board:
             for center_x, center_y in candidates:
                 cand = poly_at(center_x, center_y)
                 gap = min_gap(cand)
-                if gap >= min_clearance_mm:
+                if gap >= min_clearance_mm and allowed(cand):
                     return {
                         "reference": reference,
                         "x_mm": round(center_x - off_x, 4),
@@ -860,20 +1057,23 @@ class Board:
             r += search_step_mm
         return {
             "reference": reference, "x_mm": None, "y_mm": None, "min_gap_mm": None,
-            "note": f"no position with {min_clearance_mm}mm clearance found within "
-                    f"{max_radius_mm}mm of the anchor",
+            "note": f"no clear on-board position with {min_clearance_mm}mm clearance "
+                    f"found within {max_radius_mm}mm of the anchor",
         }
 
     def auto_place_decoupling(self, ic_reference: str, caps: list[str],
                               clearance_mm: float = 0.2,
-                              strategy: str = "nearest_pin") -> dict:
+                              strategy: str = "nearest_pin",
+                              on_board: bool = True,
+                              avoid_rule_areas: bool = True) -> dict:
         """Place each decoupling cap next to the IC pin it shares a net with.
 
         For every cap, finds an IC pad on a shared net (preferring a non-ground
         supply pin), then uses :meth:`nearest_free_position` to seat the cap's
-        courtyard against the IC without overlapping anything already placed.
-        Caps are placed one at a time so they also clear each other. Does not
-        save — the caller saves once.
+        courtyard against the IC without overlapping anything already placed,
+        staying inside the board outline and clear of keep-out zones. Caps are
+        placed one at a time so they also clear each other. Does not save — the
+        caller saves once.
         """
         self.find_footprint(ic_reference)  # validate
         before = self.ratsnest()["total_length_mm"]
@@ -895,7 +1095,8 @@ class Board:
                 unplaced.append({"cap": cap, "reason": "no net shared with the IC"})
                 continue
             pos = self.nearest_free_position(
-                cap, ic_reference, anchor["pad"], min_clearance_mm=clearance_mm)
+                cap, ic_reference, anchor["pad"], min_clearance_mm=clearance_mm,
+                on_board=on_board, avoid_rule_areas=avoid_rule_areas)
             if pos.get("x_mm") is None:
                 unplaced.append({"cap": cap, "reason": "no clear spot near the pin"})
                 continue
@@ -997,3 +1198,204 @@ class Board:
             "note": None if keepout else "outline written; KiCad computes the "
                     "actual fill on open (or run_drc with refill_zones=True)",
         }
+
+    def find_clear_region(self, min_width_mm: float, min_height_mm: float,
+                          prefer_near_pad: str | None = None, layer: str = "F.Cu",
+                          grid_step_mm: float = 0.5, clearance_mm: float = 0.0) -> dict:
+        """Find an empty axis-aligned region of at least the given size.
+
+        Scans the board on a grid for a min_width × min_height rectangle that is
+        inside the outline, clear of every courtyard on ``layer`` (by
+        ``clearance_mm``) and outside all keep-out zones / cut-outs. Returns the
+        region closest to ``prefer_near_pad`` ('REF.PAD') or the board centre.
+        """
+        side = "back" if layer.startswith("B.") else "front"
+        occupied = [e[side] for e in self._courtyard_polys() if side in e]
+        outer, blockers = self._placement_region()
+        bbox = self._edge_cuts_bbox()
+        if not bbox:
+            raise ValueError("no board outline found; cannot search for a clear region")
+        if prefer_near_pad:
+            if "." not in prefer_near_pad:
+                raise ValueError("prefer_near_pad must be 'REF.PAD', e.g. 'U1.28'")
+            pr, pd = prefer_near_pad.rsplit(".", 1)
+            pp = self.pad_position(pr, pd)
+            target = (pp["x_mm"], pp["y_mm"])
+        else:
+            target = ((bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2)
+
+        best = None
+        x = bbox[0]
+        while x + min_width_mm <= bbox[2]:
+            y = bbox[1]
+            while y + min_height_mm <= bbox[3]:
+                rect = [(x, y), (x + min_width_mm, y),
+                        (x + min_width_mm, y + min_height_mm), (x, y + min_height_mm)]
+                ok = outer is None or _poly_inside(rect, outer)
+                if ok and any(_polys_intersect(rect, b) for b in blockers):
+                    ok = False
+                if ok and any(_poly_separation(rect, o) < clearance_mm for o in occupied):
+                    ok = False
+                if ok:
+                    cxx, cyy = x + min_width_mm / 2, y + min_height_mm / 2
+                    dist = math.hypot(cxx - target[0], cyy - target[1])
+                    if best is None or dist < best[0]:
+                        best = (dist, x, y)
+                y += grid_step_mm
+            x += grid_step_mm
+
+        if best is None:
+            return {"found": False, "min_width_mm": min_width_mm,
+                    "min_height_mm": min_height_mm, "layer": layer,
+                    "note": "no clear region of that size on this layer"}
+        _, bx, by = best
+        return {
+            "found": True,
+            "x_mm": round(bx, 4), "y_mm": round(by, 4),
+            "width_mm": min_width_mm, "height_mm": min_height_mm,
+            "center_mm": [round(bx + min_width_mm / 2, 4),
+                          round(by + min_height_mm / 2, 4)],
+            "layer": layer,
+            "distance_from_target_mm": round(best[0], 4),
+        }
+
+    # -- routing (manual: you supply the path, run_drc verifies) --------------
+
+    def add_track(self, net: str, layer: str, points: list, width_mm: float) -> dict:
+        """Append copper track segments along a polyline. Does not save."""
+        pts = [(float(x), float(y)) for x, y in points]
+        if len(pts) < 2:
+            raise ValueError("a track needs at least 2 points")
+        net_node = self._net_ref_node(net)
+        for (x1, y1), (x2, y2) in zip(pts, pts[1:]):
+            self.root.append([
+                Sym("segment"),
+                [Sym("start"), num(round(x1, 6)), num(round(y1, 6))],
+                [Sym("end"), num(round(x2, 6)), num(round(y2, 6))],
+                [Sym("width"), num(width_mm)],
+                [Sym("layer"), layer],
+                [Sym("net"), *net_node[1:]],
+                _new_uuid_node(),
+            ])
+        length = sum(math.dist(pts[i], pts[i + 1]) for i in range(len(pts) - 1))
+        return {"net": net, "layer": layer, "segments_added": len(pts) - 1,
+                "length_mm": round(length, 3), "width_mm": width_mm}
+
+    def place_via(self, x: float, y: float, from_layer: str, to_layer: str,
+                  net: str, size_mm: float = 0.6, drill_mm: float = 0.3) -> dict:
+        """Append a via at (x, y) joining two layers on a net. Does not save."""
+        net_node = self._net_ref_node(net)
+        self.root.append([
+            Sym("via"),
+            [Sym("at"), num(round(x, 6)), num(round(y, 6))],
+            [Sym("size"), num(size_mm)],
+            [Sym("drill"), num(drill_mm)],
+            [Sym("layers"), from_layer, to_layer],
+            [Sym("net"), *net_node[1:]],
+            _new_uuid_node(),
+        ])
+        return {"net": net, "at_mm": [x, y], "layers": [from_layer, to_layer],
+                "size_mm": size_mm, "drill_mm": drill_mm}
+
+    def delete_tracks(self, net: str | None = None, layer: str | None = None,
+                      uuid: str | None = None) -> dict:
+        """Remove tracks/vias matching a filter. Requires at least one filter."""
+        if net is None and layer is None and uuid is None:
+            raise ValueError("specify at least one of net/layer/uuid — refusing to "
+                             "delete every track on the board")
+        removed = 0
+        keep = []
+        for item in self.root:
+            if isinstance(item, list) and item and isinstance(item[0], Sym) \
+                    and str(item[0]) in ("segment", "arc", "via"):
+                lyr = child(item, "layer")
+                u = child(item, "uuid")
+                match = True
+                if net is not None and self._net_name(child(item, "net")) != net:
+                    match = False
+                if layer is not None and (lyr is None or str(lyr[1]) != layer):
+                    match = False
+                if uuid is not None and (u is None or str(u[1]) != uuid):
+                    match = False
+                if match:
+                    removed += 1
+                    continue
+            keep.append(item)
+        self.root[:] = keep
+        return {"removed": removed,
+                "filter": {"net": net, "layer": layer, "uuid": uuid}}
+
+    def measure_track_length(self, net: str) -> dict:
+        """Total routed copper length on a net (segments + arcs), and via count."""
+        total = 0.0
+        nseg = 0
+        for s in children(self.root, "segment"):
+            if self._net_name(child(s, "net")) != net:
+                continue
+            st, en = child(s, "start"), child(s, "end")
+            total += math.dist((to_float(st[1]), to_float(st[2])),
+                               (to_float(en[1]), to_float(en[2])))
+            nseg += 1
+        for a in children(self.root, "arc"):
+            if self._net_name(child(a, "net")) != net:
+                continue
+            st, mid, en = child(a, "start"), child(a, "mid"), child(a, "end")
+            if st and mid and en:
+                total += _arc_length((to_float(st[1]), to_float(st[2])),
+                                     (to_float(mid[1]), to_float(mid[2])),
+                                     (to_float(en[1]), to_float(en[2])))
+                nseg += 1
+        nvia = sum(1 for v in children(self.root, "via")
+                   if self._net_name(child(v, "net")) == net)
+        return {"net": net, "routed_length_mm": round(total, 3),
+                "segment_count": nseg, "via_count": nvia}
+
+    def generate_spiral_coil(self, center: tuple, od_mm: float, id_mm: float,
+                             turns: float, trace_width_mm: float, layer: str,
+                             net: str, points_per_turn: int = 48) -> dict:
+        """Lay an Archimedean spiral as track segments on a net. Does not save.
+
+        Spirals from id_mm to od_mm over ``turns`` revolutions. Returns the
+        start/end coordinates so the ends can be routed to the rest of the net.
+        """
+        cx, cy = float(center[0]), float(center[1])
+        r0, r1 = id_mm / 2.0, od_mm / 2.0
+        if r1 <= r0:
+            raise ValueError("od_mm must be greater than id_mm")
+        if turns <= 0:
+            raise ValueError("turns must be positive")
+        n = max(8, int(round(points_per_turn * turns)))
+        pts = []
+        for i in range(n + 1):
+            frac = i / n
+            ang = 2 * math.pi * turns * frac
+            r = r0 + (r1 - r0) * frac
+            pts.append((cx + r * math.cos(ang), cy + r * math.sin(ang)))
+        res = self.add_track(net, layer, pts, trace_width_mm)
+        res.update({
+            "turns": turns,
+            "start_mm": [round(pts[0][0], 4), round(pts[0][1], 4)],
+            "end_mm": [round(pts[-1][0], 4), round(pts[-1][1], 4)],
+        })
+        return res
+
+    def apply_netclass(self, net: str, class_name: str) -> dict:
+        """Assign a net to an existing netclass in the sibling .kicad_pro. Saves it."""
+        pro_path = self.path[: -len(".kicad_pcb")] + ".kicad_pro"
+        if not os.path.isfile(pro_path):
+            raise FileNotFoundError(
+                "no .kicad_pro project file next to the board; netclasses live there")
+        with open(pro_path, encoding="utf-8") as f:
+            pro = json.load(f)
+        ns = pro.setdefault("net_settings", {})
+        defined = {c.get("name") for c in ns.get("classes", [])}
+        if class_name not in defined:
+            raise ValueError(
+                f"netclass {class_name!r} is not defined in the project; "
+                f"have: {sorted(n for n in defined if n)}")
+        patterns = ns.setdefault("netclass_patterns", [])
+        patterns[:] = [p for p in patterns if p.get("pattern") != net]
+        patterns.append({"netclass": class_name, "pattern": net})
+        backup = guarded_write(pro_path, json.dumps(pro, indent=2))
+        return {"net": net, "netclass": class_name,
+                "project_file": pro_path, "backup": backup}

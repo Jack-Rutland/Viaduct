@@ -73,6 +73,104 @@ def _new_uuid_node():
     return [Sym("uuid"), str(uuid_mod.uuid4())]
 
 
+def _full_shape_points(shape, kind: str) -> list[tuple[float, float]]:
+    """All corner/vertex points of a graphic shape in its own frame.
+
+    Unlike :meth:`Board._shape_points` (which returns just the extreme
+    points, enough for a bounding box), this expands rectangles to four
+    corners so the result is a real polygon usable for collision tests.
+    """
+    def pt(name):
+        n = child(shape, name)
+        return (to_float(n[1]), to_float(n[2])) if n else None
+
+    if kind == "rect":
+        s, e = pt("start"), pt("end")
+        if not s or not e:
+            return []
+        return [(s[0], s[1]), (e[0], s[1]), (e[0], e[1]), (s[0], e[1])]
+    if kind == "line":
+        return [p for p in (pt("start"), pt("end")) if p is not None]
+    if kind == "arc":
+        return [p for p in (pt("start"), pt("mid"), pt("end")) if p is not None]
+    if kind == "circle":
+        c, e = pt("center"), pt("end")
+        if not c or not e:
+            return []
+        r = math.dist(c, e)
+        return [(c[0] - r, c[1] - r), (c[0] + r, c[1] - r),
+                (c[0] + r, c[1] + r), (c[0] - r, c[1] + r)]
+    if kind in ("poly", "curve"):
+        pts_node = child(shape, "pts")
+        out = []
+        if pts_node:
+            for xy in children(pts_node, "xy"):
+                out.append((to_float(xy[1]), to_float(xy[2])))
+        return out
+    return []
+
+
+def _convex_hull(points: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    """Convex hull (counter-clockwise) via Andrew's monotone chain."""
+    pts = sorted(set(points))
+    if len(pts) <= 2:
+        return pts
+
+    def cross(o, a, b):
+        return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+
+    lower = []
+    for p in pts:
+        while len(lower) >= 2 and cross(lower[-2], lower[-1], p) <= 0:
+            lower.pop()
+        lower.append(p)
+    upper = []
+    for p in reversed(pts):
+        while len(upper) >= 2 and cross(upper[-2], upper[-1], p) <= 0:
+            upper.pop()
+        upper.append(p)
+    return lower[:-1] + upper[:-1]
+
+
+def _poly_separation(a: list[tuple[float, float]], b: list[tuple[float, float]]) -> float:
+    """Signed separation between two convex polygons (separating-axis theorem).
+
+    Positive = the closest gap between them (millimetres); negative = they
+    overlap, magnitude is the penetration depth. Candidate axes are the edge
+    normals of both polygons, which is exact for convex shapes. Courtyards are
+    convex rectangles in practice; a non-convex courtyard is approximated by
+    its convex hull before this is called.
+    """
+    best = -math.inf
+    for poly in (a, b):
+        n = len(poly)
+        for k in range(n):
+            x1, y1 = poly[k]
+            x2, y2 = poly[(k + 1) % n]
+            nx, ny = -(y2 - y1), (x2 - x1)
+            length = math.hypot(nx, ny)
+            if length == 0:
+                continue
+            nx, ny = nx / length, ny / length
+            aproj = [nx * px + ny * py for px, py in a]
+            bproj = [nx * px + ny * py for px, py in b]
+            overlap = min(max(aproj), max(bproj)) - max(min(aproj), min(bproj))
+            if -overlap > best:
+                best = -overlap
+    return best
+
+
+def _poly_area(poly: list[tuple[float, float]]) -> float:
+    """Absolute area of a simple polygon (shoelace formula)."""
+    n = len(poly)
+    s = 0.0
+    for i in range(n):
+        x1, y1 = poly[i]
+        x2, y2 = poly[(i + 1) % n]
+        s += x1 * y2 - x2 * y1
+    return abs(s) / 2.0
+
+
 class Board:
     def __init__(self, path: str):
         self.path = os.path.abspath(path)
@@ -574,3 +672,328 @@ class Board:
                 "no .kicad_pro project file next to the board; net-class rules unavailable"
             )
         return out
+
+    # -- collision detection --------------------------------------------------
+
+    def _courtyard_polys(self) -> list[dict]:
+        """Per footprint, the convex courtyard polygon in board mm, per side.
+
+        Returns ``{"reference": ref, "front": [(x,y)...], "back": [...]}`` with
+        a side key present only when that side has a courtyard. Front and back
+        are kept apart so parts on opposite sides of the board don't read as
+        colliding (matching KiCad's per-side courtyard DRC).
+        """
+        out = []
+        for fp in self.footprint_nodes():
+            fx, fy, frot = _get_at(fp)
+            sides: dict[str, list] = {}
+            for kind in FP_SHAPES:
+                for shape in children(fp, kind):
+                    layer = child(shape, "layer")
+                    lname = str(layer[1]) if layer else ""
+                    if not lname.endswith(".CrtYd"):
+                        continue
+                    side = "back" if lname.startswith("B.") else "front"
+                    for px, py in _full_shape_points(shape, kind.replace("fp_", "")):
+                        dx, dy = _rot(px, py, frot)
+                        sides.setdefault(side, []).append((fx + dx, fy + dy))
+            entry = {"reference": self.fp_ref(fp)}
+            for side, pts in sides.items():
+                hull = _convex_hull(pts)
+                if len(hull) >= 3:
+                    entry[side] = hull
+            out.append(entry)
+        return out
+
+    def collisions(self, references: list[str] | None = None,
+                   clearance_mm: float = 0.0) -> list[dict]:
+        """Footprint pairs whose courtyards overlap or sit closer than clearance.
+
+        With ``clearance_mm`` 0, only true courtyard overlaps (a DRC error) are
+        returned. A positive clearance also flags pairs merely closer than that
+        gap. If ``references`` is given, only pairs touching one of those
+        footprints are reported (use it to check the parts you just moved).
+        """
+        polys = self._courtyard_polys()
+        wanted = set(references) if references else None
+        pairs = []
+        for i in range(len(polys)):
+            for j in range(i + 1, len(polys)):
+                a, b = polys[i], polys[j]
+                if wanted is not None and a["reference"] not in wanted \
+                        and b["reference"] not in wanted:
+                    continue
+                for side in ("front", "back"):
+                    if side in a and side in b:
+                        sep = _poly_separation(a[side], b[side])
+                        if sep < clearance_mm:
+                            pairs.append({
+                                "a": a["reference"],
+                                "b": b["reference"],
+                                "side": side,
+                                "gap_mm": round(sep, 4),
+                                "overlap": sep < 0,
+                            })
+        pairs.sort(key=lambda p: p["gap_mm"])
+        return pairs
+
+    # -- targeted queries -----------------------------------------------------
+
+    def pad_position(self, reference: str, pad_number) -> dict:
+        """Absolute position and net of a single pad (e.g. U1, '28')."""
+        pad_number = str(pad_number)
+        for p in self.pads():
+            if p["reference"] == reference and p["pad"] == pad_number:
+                return {k: p[k] for k in ("reference", "pad", "net", "x_mm",
+                                          "y_mm", "angle_deg", "size_mm", "layers")}
+        raise KeyError(f"no pad {reference}.{pad_number} in {os.path.basename(self.path)}")
+
+    def net_endpoints(self, net: str) -> dict:
+        """Every pad on a net with positions, plus how many track clusters exist."""
+        net_pads = [p for p in self.pads() if p["net"] == net]
+        if not net_pads:
+            raise KeyError(f"no pads on net {net!r}")
+        links = [l for l in self._track_links() if l["net"] == net]
+        clusters = self._net_clusters(net_pads, links)
+        return {
+            "net": net,
+            "pad_count": len(net_pads),
+            "cluster_count": len(clusters),
+            "pads": [
+                {
+                    "pad": f"{p['reference']}.{p['pad']}",
+                    "x_mm": p["x_mm"],
+                    "y_mm": p["y_mm"],
+                    "layers": p["layers"],
+                }
+                for p in net_pads
+            ],
+        }
+
+    def measure_placement_quality(self) -> dict:
+        """Placement-quality components (not a single blended score).
+
+        Returns the ratsnest length, airwire count, courtyard collision count,
+        and area utilisation so the caller can see *which* dimension changed
+        between passes. DRC is left to ``run_drc`` (it shells out to kicad-cli).
+        """
+        rn = self.ratsnest()
+        cols = self.collisions()
+        polys = self._courtyard_polys()
+        used = sum(_poly_area(e["front"]) for e in polys if "front" in e)
+        bbox = self._edge_cuts_bbox()
+        board_area = (bbox[2] - bbox[0]) * (bbox[3] - bbox[1]) if bbox else None
+        return {
+            "ratsnest_total_mm": rn["total_length_mm"],
+            "airwire_count": rn["airwire_count"],
+            "courtyard_collision_count": len(cols),
+            "collisions": cols,
+            "courtyard_area_mm2": round(used, 2),
+            "board_area_mm2": round(board_area, 2) if board_area else None,
+            "area_utilization": round(used / board_area, 4) if board_area else None,
+            "note": "components, not a blended score; lower ratsnest and zero "
+                    "collisions are better",
+        }
+
+    def nearest_free_position(self, reference: str, anchor_reference: str,
+                              anchor_pad, min_clearance_mm: float = 0.2,
+                              search_step_mm: float = 0.25,
+                              angle_step_deg: float = 15.0,
+                              max_radius_mm: float = 40.0) -> dict:
+        """Closest position to an anchor pad where *reference*'s courtyard is clear.
+
+        Searches outward in rings from the anchor pad and returns the first
+        footprint origin (current rotation kept) at which this footprint's
+        courtyard clears every other footprint by ``min_clearance_mm``. Does not
+        move anything — returns the suggested (x_mm, y_mm).
+        """
+        fp = self.find_footprint(reference)
+        anchor = self.pad_position(anchor_reference, anchor_pad)
+        ax, ay = anchor["x_mm"], anchor["y_mm"]
+        polys = self._courtyard_polys()
+        mine = next((e for e in polys if e["reference"] == reference), None)
+        others = [e for e in polys if e["reference"] != reference and "front" in e]
+        fx, fy, _ = _get_at(fp)
+        if mine is None or "front" not in mine:
+            return {
+                "reference": reference, "x_mm": round(ax, 4), "y_mm": round(ay, 4),
+                "min_gap_mm": None,
+                "note": "footprint has no front courtyard; returning the anchor position",
+            }
+        cur = mine["front"]
+        cx = sum(p[0] for p in cur) / len(cur)
+        cy = sum(p[1] for p in cur) / len(cur)
+        off_x, off_y = cx - fx, cy - fy
+
+        def poly_at(center_x, center_y):
+            ddx, ddy = center_x - cx, center_y - cy
+            return [(px + ddx, py + ddy) for px, py in cur]
+
+        def min_gap(cand):
+            return min((_poly_separation(cand, e["front"]) for e in others),
+                       default=math.inf)
+
+        r = 0.0
+        while r <= max_radius_mm:
+            if r == 0.0:
+                candidates = [(ax, ay)]
+            else:
+                n = max(8, int(round(360.0 / angle_step_deg)))
+                candidates = [
+                    (ax + r * math.cos(math.radians(k * 360.0 / n)),
+                     ay + r * math.sin(math.radians(k * 360.0 / n)))
+                    for k in range(n)
+                ]
+            for center_x, center_y in candidates:
+                cand = poly_at(center_x, center_y)
+                gap = min_gap(cand)
+                if gap >= min_clearance_mm:
+                    return {
+                        "reference": reference,
+                        "x_mm": round(center_x - off_x, 4),
+                        "y_mm": round(center_y - off_y, 4),
+                        "anchor": f"{anchor_reference}.{anchor_pad}",
+                        "distance_from_anchor_mm": round(
+                            math.hypot(center_x - ax, center_y - ay), 4),
+                        "min_gap_mm": round(gap, 4) if gap != math.inf else None,
+                    }
+            r += search_step_mm
+        return {
+            "reference": reference, "x_mm": None, "y_mm": None, "min_gap_mm": None,
+            "note": f"no position with {min_clearance_mm}mm clearance found within "
+                    f"{max_radius_mm}mm of the anchor",
+        }
+
+    def auto_place_decoupling(self, ic_reference: str, caps: list[str],
+                              clearance_mm: float = 0.2,
+                              strategy: str = "nearest_pin") -> dict:
+        """Place each decoupling cap next to the IC pin it shares a net with.
+
+        For every cap, finds an IC pad on a shared net (preferring a non-ground
+        supply pin), then uses :meth:`nearest_free_position` to seat the cap's
+        courtyard against the IC without overlapping anything already placed.
+        Caps are placed one at a time so they also clear each other. Does not
+        save — the caller saves once.
+        """
+        self.find_footprint(ic_reference)  # validate
+        before = self.ratsnest()["total_length_mm"]
+        ic_pads = [p for p in self.pads() if p["reference"] == ic_reference]
+        placed, unplaced = [], []
+        for cap in caps:
+            cap_pads = [p for p in self.pads() if p["reference"] == cap]
+            if not cap_pads:
+                unplaced.append({"cap": cap, "reason": "footprint not found"})
+                continue
+            cap_nets = {p["net"] for p in cap_pads if p["net"]}
+            # prefer a supply (non-GND) pin so the cap body sits at the rail
+            anchor = None
+            for p in sorted(ic_pads, key=lambda q: "GND" in q["net"].upper()):
+                if p["net"] in cap_nets:
+                    anchor = p
+                    break
+            if anchor is None:
+                unplaced.append({"cap": cap, "reason": "no net shared with the IC"})
+                continue
+            pos = self.nearest_free_position(
+                cap, ic_reference, anchor["pad"], min_clearance_mm=clearance_mm)
+            if pos.get("x_mm") is None:
+                unplaced.append({"cap": cap, "reason": "no clear spot near the pin"})
+                continue
+            self.move_footprint(cap, pos["x_mm"], pos["y_mm"])
+            placed.append({
+                "cap": cap,
+                "anchor_pad": f"{ic_reference}.{anchor['pad']}",
+                "net": anchor["net"],
+                "x_mm": pos["x_mm"],
+                "y_mm": pos["y_mm"],
+                "min_gap_mm": pos.get("min_gap_mm"),
+            })
+        after = self.ratsnest()["total_length_mm"]
+        return {
+            "ic": ic_reference,
+            "strategy": strategy,
+            "placed": placed,
+            "unplaced": unplaced,
+            "ratsnest_before_mm": before,
+            "ratsnest_after_mm": after,
+        }
+
+    # -- zones / rule areas ---------------------------------------------------
+
+    def _net_ref_node(self, net_name: str | None):
+        """Build a ``(net ...)`` reference matching this file's net format.
+
+        Reuses the exact atoms of an existing pad's net reference for the named
+        net so KiCad ≤9 (numbered) and KiCad 10 (name-only) both round-trip.
+        """
+        if net_name:
+            for fp in self.footprint_nodes():
+                for pad in children(fp, "pad"):
+                    nn = child(pad, "net")
+                    if nn is not None and self._net_name(nn) == net_name:
+                        return [Sym("net"), *nn[1:]]
+            table = self._net_table()
+            for num_s, nm in table.items():
+                if nm == net_name:
+                    return [Sym("net"), Sym(num_s), net_name]
+            # name not found on any pad/table: emit name-only (KiCad 10 form)
+            return [Sym("net"), net_name]
+        # no net (keep-out / rule area)
+        return [Sym("net"), Sym("0")] if self._net_table() else [Sym("net"), ""]
+
+    def add_zone(self, polygon: list[tuple[float, float]], layers, net: str | None = None,
+                 keepout: dict | None = None, name: str | None = None) -> dict:
+        """Append a zone (filled copper pour or keep-out rule area). Does not save.
+
+        ``polygon`` is the outline as [(x, y), ...] in board mm. ``layers`` is a
+        comma string or list. For a keep-out, pass ``keepout`` mapping any of
+        tracks/vias/pads/copperpour/footprints to True (= not allowed). For a
+        copper pour, pass ``net``. Note: viaduct writes the zone outline and
+        settings but does NOT compute the copper fill — KiCad fills it on open
+        (or via ``run_drc(refill_zones=True)``).
+        """
+        poly = [(float(x), float(y)) for x, y in polygon]
+        if len(poly) < 3:
+            raise ValueError("a zone polygon needs at least 3 points")
+        layer_list = layers if isinstance(layers, list) else \
+            [l.strip() for l in layers.split(",") if l.strip()]
+        if not layer_list:
+            raise ValueError("at least one layer is required")
+
+        zone = [Sym("zone"), self._net_ref_node(net), [Sym("net_name"), net or ""]]
+        if len(layer_list) == 1:
+            zone.append([Sym("layer"), layer_list[0]])
+        else:
+            zone.append([Sym("layers"), *layer_list])
+        zone.append(_new_uuid_node())
+        if name:
+            zone.append([Sym("name"), name])
+        zone.append([Sym("hatch"), Sym("edge"), num(0.5)])
+        zone.append([Sym("connect_pads"), [Sym("clearance"), num(0 if keepout else 0.5)]])
+        zone.append([Sym("min_thickness"), num(0.25)])
+        if keepout:
+            def ka(k):
+                return Sym("not_allowed") if keepout.get(k) else Sym("allowed")
+            zone.append([
+                Sym("keepout"),
+                [Sym("tracks"), ka("tracks")],
+                [Sym("vias"), ka("vias")],
+                [Sym("pads"), ka("pads")],
+                [Sym("copperpour"), ka("copperpour")],
+                [Sym("footprints"), ka("footprints")],
+            ])
+        zone.append([Sym("fill"),
+                     [Sym("thermal_gap"), num(0.5)],
+                     [Sym("thermal_bridge_width"), num(0.5)]])
+        zone.append([Sym("polygon"),
+                     [Sym("pts"), *[[Sym("xy"), num(x), num(y)] for x, y in poly]]])
+        self.root.append(zone)
+        return {
+            "added": "keepout" if keepout else "filled_zone",
+            "layers": layer_list,
+            "net": net,
+            "name": name,
+            "points": len(poly),
+            "note": None if keepout else "outline written; KiCad computes the "
+                    "actual fill on open (or run_drc with refill_zones=True)",
+        }

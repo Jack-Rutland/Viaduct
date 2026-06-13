@@ -2,8 +2,13 @@
 
 from __future__ import annotations
 
+import glob
 import os
+import re
 import shutil
+
+HISTORY_SUFFIX = ".vbak"  # rolling numbered backups: foo.kicad_pcb.vbak0001, ...
+HISTORY_KEEP = 10
 
 
 class BoardLockedError(RuntimeError):
@@ -55,11 +60,77 @@ def restore_backup(file_path: str) -> str:
 
 
 def guarded_write(file_path: str, text: str) -> str:
-    """Lockfile check + backup + atomic-ish write. Returns the backup path."""
+    """Lockfile check + backup + atomic-ish write. Returns the .bak path.
+
+    Also appends the pre-edit state to the rolling numbered history so several
+    edits can be undone (see :func:`list_backups` / :func:`restore_to`).
+    """
     check_not_locked(file_path)
+    make_history_backup(file_path)
     bak = make_backup(file_path)
     tmp = file_path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         f.write(text)
     os.replace(tmp, file_path)
     return bak
+
+
+# ---------------------------------------------------------------------------
+# Rolling numbered backup history (multi-step undo)
+# ---------------------------------------------------------------------------
+
+def _history_glob(file_path: str) -> str:
+    return f"{os.path.abspath(file_path)}{HISTORY_SUFFIX}*"
+
+
+def _history_index(path: str) -> int:
+    m = re.search(re.escape(HISTORY_SUFFIX) + r"(\d+)$", path)
+    return int(m.group(1)) if m else 0
+
+
+def make_history_backup(file_path: str, keep: int = HISTORY_KEEP) -> str | None:
+    """Copy the current file to the next numbered ``.vbakNNNN`` slot, pruning old ones."""
+    file_path = os.path.abspath(file_path)
+    if not os.path.isfile(file_path):
+        return None
+    existing = sorted(glob.glob(_history_glob(file_path)), key=_history_index)
+    idx = (_history_index(existing[-1]) if existing else 0) + 1
+    dst = f"{file_path}{HISTORY_SUFFIX}{idx:04d}"
+    shutil.copy2(file_path, dst)
+    for old in (existing + [dst])[:-keep]:
+        try:
+            os.remove(old)
+        except OSError:
+            pass
+    return dst
+
+
+def list_backups(file_path: str) -> list[dict]:
+    """All backups for a file: the last-edit ``.bak`` plus the numbered history.
+
+    Newest first. The ``name`` of each entry is what :func:`restore_to` accepts.
+    """
+    file_path = os.path.abspath(file_path)
+    out = []
+    bak = backup_path(file_path)
+    if os.path.isfile(bak):
+        out.append({"name": os.path.basename(bak), "kind": "last_edit",
+                    "size_bytes": os.path.getsize(bak)})
+    for p in sorted(glob.glob(_history_glob(file_path)), key=_history_index, reverse=True):
+        out.append({"name": os.path.basename(p), "kind": "history",
+                    "index": _history_index(p), "size_bytes": os.path.getsize(p)})
+    return out
+
+
+def restore_to(file_path: str, name: str) -> str:
+    """Restore a specific backup (by its ``name`` from :func:`list_backups`)."""
+    file_path = os.path.abspath(file_path)
+    base = os.path.basename(file_path)
+    if os.path.basename(name) != name or not name.startswith(base):
+        raise BackupError(f"{name!r} is not a backup of {base}")
+    src = os.path.join(os.path.dirname(file_path), name)
+    if not os.path.isfile(src):
+        raise BackupError(f"no such backup {name!r}")
+    check_not_locked(file_path)
+    shutil.copy2(src, file_path)
+    return file_path

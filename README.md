@@ -46,10 +46,20 @@ Sanity check: ask Claude to run the `kicad_version` tool.
 | `courtyards` | Per footprint: courtyard bounding box in board coordinates (mm) |
 | `ratsnest` | Unrouted connections as airwires (from-pad, to-pad, length mm) — the placement metric |
 | `design_rules` | Clearance / track width / via rules from board setup + `.kicad_pro` net classes |
-| `move_footprint` | Move/rotate one footprint (pad angles handled), with backup |
-| `move_footprints` | Batch move — one backup, one save; preferred for placement passes |
+| `check_collisions` | Footprint pairs whose courtyards overlap (or sit closer than a clearance), via SAT |
+| `pad_position` | Absolute position, net, and size of a single pad (e.g. `U1`, `28`) |
+| `net_endpoints` | Every pad on a net with positions + how many track clusters remain |
+| `measure_placement_quality` | Ratsnest length, airwire/collision counts, area use — components, not a blended score |
+| `footprint_info` | Dimensions, pad count, courtyard of a library footprint, *without* placing it |
+| `move_footprint` | Move/rotate one footprint (pad angles handled), with backup; can reject collisions |
+| `move_footprints` | Batch move — one backup, one save; reports collisions, optional reject-on-collision |
+| `nearest_free_position` | Closest spot to a pin where a footprint's courtyard clears everything (no move) |
+| `auto_place_decoupling` | Seat decoupling caps against the IC pin each one shares a net with |
 | `set_board_outline_rect` | Replace the Edge.Cuts outline with a rectangle |
+| `add_rule_area` | Add a keep-out rule area over a polygon |
+| `add_filled_zone` | Add a copper-pour zone outline on a net (KiCad computes the fill on open) |
 | `restore_backup` | Restore a file from the `.bak` written before the last edit |
+| `backup_list` / `backup_restore_to` | List the rolling numbered backup history and restore any entry |
 | `list_symbols` | Schematic symbols: reference, value, lib_id, footprint, position |
 | `list_labels` | Local/global/hierarchical net labels |
 | `set_symbol_property` | Set Value, Footprint, MPN, … on a symbol |
@@ -70,9 +80,12 @@ viaduct is built around an iterate-until-clean placement workflow:
 1. **Understand** — `board_info`, `design_rules`, `list_footprints`, `connectivity`,
    `ratsnest`: what's on the board, what connects to what, how bad is it now.
 2. **Place** — `move_footprints` in batches (decoupling caps next to their IC pins,
-   connectors on edges, group by function).
+   connectors on edges, group by function). `move_footprints` reports any courtyard
+   collisions it creates and can `reject_on_collision`; `nearest_free_position` and
+   `auto_place_decoupling` place parts against a pin without overlap in the first place.
 3. **Look** — `render_board_png`: the model visually inspects its own placement.
-4. **Measure** — `ratsnest` again: total airwire length should drop.
+4. **Measure** — `measure_placement_quality` / `ratsnest`: airwire length and collision
+   count should drop. `check_collisions` lists any remaining courtyard overlaps directly.
 5. **Verify** — `run_drc`: fix courtyard overlaps and clearance violations.
 6. Repeat 2–5 until DRC is clean and the render looks tidy.
 

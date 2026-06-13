@@ -220,6 +220,94 @@ def main():
     st = cli_ops.export_step(pcb)
     check("step export", st["size_bytes"] > 1000)
 
+    print("== targeted queries: pad_position / net_endpoints ==")
+    fresh = Board(pcb_fresh(tmp, "board2"))
+    pp = fresh.pad_position("U1", "8")
+    check("pad_position net + coords", pp["net"] == "VCC" and isinstance(pp["x_mm"], float))
+    try:
+        fresh.pad_position("U1", "999")
+        check("pad_position missing raises", False)
+    except KeyError:
+        check("pad_position missing raises", True)
+    ne = fresh.net_endpoints("GND")
+    check("net_endpoints lists pads", ne["pad_count"] >= 3 and "U1.4" in {p["pad"] for p in ne["pads"]})
+
+    print("== collision detection (SAT courtyards) ==")
+    check("no baseline collisions", fresh.collisions() == [])
+    c1 = next(f for f in fresh.list_footprints() if f["reference"] == "C1")
+    fresh.move_footprint("C2", c1["x_mm"], c1["y_mm"])  # stack C2 on C1
+    cols = fresh.collisions(references=["C2"])
+    check("overlap detected", len(cols) == 1 and cols[0]["overlap"] and cols[0]["gap_mm"] < 0,
+          str(cols))
+    check("collision side reported", cols[0]["side"] == "front")
+
+    print("== nearest_free_position / auto_place_decoupling ==")
+    b3path = pcb_fresh(tmp, "board3")
+    b = Board(b3path)
+    nf = b.nearest_free_position("C1", "U1", "8", min_clearance_mm=0.3)
+    check("nearest_free_position returns a clear spot",
+          nf["x_mm"] is not None and nf["min_gap_mm"] >= 0.3 - 1e-6, str(nf))
+    ap = b.auto_place_decoupling("U1", ["C1", "C2"], clearance_mm=0.3)
+    check("auto_place placed both caps", len(ap["placed"]) == 2 and not ap["unplaced"], str(ap))
+    check("auto_place improved ratsnest",
+          ap["ratsnest_after_mm"] < ap["ratsnest_before_mm"],
+          f"{ap['ratsnest_after_mm']} !< {ap['ratsnest_before_mm']}")
+    check("auto_place left no collisions", b.collisions() == [], str(b.collisions()))
+    b.save()
+    check("KiCad accepts auto-placed board", cli_ops.run_drc(b3path)["violation_count"] >= 0)
+    mq = Board(b3path).measure_placement_quality()
+    check("measure_placement_quality components",
+          mq["courtyard_collision_count"] == 0 and "ratsnest_total_mm" in mq
+          and "area_utilization" in mq)
+
+    print("== zones / rule areas (KiCad must accept the file) ==")
+    b = Board(b3path)
+    b.add_zone([[40, 48], [50, 48], [50, 58], [40, 58]], "F.Cu",
+               keepout={"tracks": True, "vias": True, "copperpour": True}, name="cutout")
+    b.add_zone([[30, 30], [80, 30], [80, 70], [30, 70]], "B.Cu", net="GND", name="gnd_pour")
+    b.save()
+    check("zones added to board", Board(b3path).board_info()["zone_count"] >= 2)
+    check("KiCad accepts board with new zones", cli_ops.run_drc(b3path)["violation_count"] >= 0)
+
+    print("== multi-backup history ==")
+    from viaduct.safety import list_backups, restore_to
+    baks = list_backups(b3path)
+    check("backup history + last-edit recorded",
+          any(x["kind"] == "history" for x in baks)
+          and any(x["kind"] == "last_edit" for x in baks), str(baks))
+    oldest = [x for x in baks if x["kind"] == "history"][-1]["name"]
+    restore_to(b3path, oldest)
+    check("restore_to an older backup runs", cli_ops.run_drc(b3path)["violation_count"] >= 0)
+    try:
+        restore_to(b3path, "../etc/passwd")
+        check("restore_to rejects foreign names", False)
+    except Exception:
+        check("restore_to rejects foreign names", True)
+
+    print("== DRC summary / detail shaping ==")
+    from viaduct import reports
+    full = cli_ops.run_drc(pcb)
+    summ = reports.compact_drc(full, "summary", top_n=3)
+    check("drc summary trims lists",
+          "worst" in summ and "violations" not in summ and len(summ["worst"]) <= 3)
+    check("drc full passthrough", reports.compact_drc(full, "full") is full)
+    if full["by_type"]:
+        t = next(iter(full["by_type"]))
+        det = reports.compact_drc(full, t)
+        check("drc detail filters by type",
+              det["count"] >= 1 and all(v["type"] == t for v in det["violations"]))
+
+    print("== footprint_info (library lookup) ==")
+    from viaduct import footprints
+    try:
+        fi = footprints.footprint_info("Resistor_SMD:R_0603_1608Metric")
+        check("footprint_info pad count", fi["pad_count"] == 2, str(fi))
+        check("footprint_info courtyard size",
+              fi["courtyard"] is not None and fi["courtyard"]["width_mm"] > 0)
+        check("footprint_info smd flag", fi["smd"] is True)
+    except FileNotFoundError as e:
+        print(f"  [skip] standard footprint library not found ({e})")
+
     print("== MCP server (optional, needs `mcp` package) ==")
     try:
         import mcp  # noqa: F401
@@ -234,13 +322,29 @@ def main():
             "list_symbols", "list_labels", "set_symbol_property", "export_gerbers",
             "export_bom", "export_step", "export_netlist", "render_board_svg",
             "render_board_png", "restore_backup",
+            # collision-aware placement + queries
+            "check_collisions", "pad_position", "net_endpoints",
+            "measure_placement_quality", "nearest_free_position",
+            "auto_place_decoupling", "add_rule_area", "add_filled_zone",
+            "footprint_info", "backup_list", "backup_restore_to",
         }
-        check("all 23 tools registered", expected <= names, str(expected - names))
+        check("all 34 tools registered", expected <= names, str(expected - names))
     except ImportError:
         print("  [skip] mcp package not installed; server registration not tested")
 
     shutil.rmtree(tmp, ignore_errors=True)
     print(f"\nAll {PASS} checks passed (KiCad {ver}).")
+
+
+def pcb_fresh(tmp: str, name: str) -> str:
+    """Copy the pristine fixture board to tmp/<name>.kicad_pcb and return its path.
+
+    Used by the collision/placement tests that mutate a board, so they start
+    from a clean layout independent of the edits earlier sections made.
+    """
+    dst = os.path.join(tmp, f"{name}.kicad_pcb")
+    shutil.copy2(os.path.join(PROJECT, "testboard.kicad_pcb"), dst)
+    return dst
 
 
 def parse_ipcd356(path: str) -> dict:

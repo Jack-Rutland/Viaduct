@@ -43,6 +43,16 @@ Placement only — do not attempt to route traces by editing the file.
   matching DRC's unconnected count.
 - **design_rules** needs the sibling `.kicad_pro` for net-class rules; board-file `setup`
   alone has only a few values.
+- **Collisions** (`check_collisions`/`collisions`) run SAT on the *convex hull* of each
+  courtyard, with front and back courtyards compared separately (opposite-side parts don't
+  collide). `gap_mm` is signed: negative = overlapping by that much. `clearance_mm` 0 means
+  true overlaps only (a DRC error); a positive value also flags parts merely too close. A
+  non-convex courtyard is approximated by its hull, so it errs toward *over*-reporting.
+- **Zones**: `add_filled_zone` writes only the zone outline + settings — viaduct does **not**
+  compute the copper fill (that's KiCad's fill engine). KiCad fills on open, or pass
+  `refill_zones=True` to `run_drc`. `add_rule_area` is a keep-out and needs no fill. Net
+  references in a new zone are copied from an existing pad on that net so both the KiCad ≤9
+  numbered and KiCad 10 name-only formats round-trip.
 - **Net format**: KiCad 10 stores nets by name only, `(net "GND")`; KiCad ≤9 uses a
   numbered net table. `board.py` handles both — keep it that way.
 - **Pad angle quirk** (verified): a pad's stored `(at x y angle)` angle is the SUM of pad
@@ -54,9 +64,15 @@ Placement only — do not attempt to route traces by editing the file.
 
 - `src/viaduct/sexpr.py` — parser/serializer. Quoted strings → `str`, bare tokens →
   `Sym(str)`; numbers stay as source text so untouched values round-trip exactly.
-- `src/viaduct/board.py` — board model: footprints, pads, courtyards, ratsnest, moves.
+- `src/viaduct/board.py` — board model: footprints, pads, courtyards, ratsnest, moves,
+  plus SAT courtyard-collision detection (`_poly_separation`/`collisions`),
+  placement helpers (`nearest_free_position`, `auto_place_decoupling`,
+  `measure_placement_quality`), and zone/rule-area insertion (`add_zone`).
+- `src/viaduct/footprints.py` — read `.kicad_mod` library files for `footprint_info`
+  (dimensions/courtyard *without* placing); honours `VIADUCT_FOOTPRINT_DIRS`.
 - `src/viaduct/schematic.py` — symbols, labels, properties.
-- `src/viaduct/safety.py` — lockfile check, `.bak` backups, guarded writes.
+- `src/viaduct/safety.py` — lockfile check, `.bak` backups, guarded writes, plus a
+  rolling numbered backup history (`.vbakNNNN`, `list_backups`/`restore_to`).
 - `src/viaduct/kicad_cli.py` / `cli_ops.py` / `reports.py` — kicad-cli discovery,
   subprocess ops, ERC/DRC JSON summarisation (shapes verified against kicad-cli 10.0.3).
 - `src/viaduct/server.py` — FastMCP tool definitions only; logic lives in the modules

@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+
+# viaduct outputs
+viaduct_out/
+*.bak
+
+# KiCad noise
+*.lck
+~*.lck
+*-backups/
+fp-info-cache
+
+# OS
+.DS_Store
+*.kicad_prl
